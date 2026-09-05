@@ -1,0 +1,780 @@
+diff --git a/agent/acp_openai_bridge.py b/agent/acp_openai_bridge.py
+index 4b66350a28..de27a66181 100644
+--- a/agent/acp_openai_bridge.py
++++ b/agent/acp_openai_bridge.py
+@@ -34,6 +34,7 @@ from __future__ import annotations
+ 
+ import json
+ import re
++from collections.abc import Mapping
+ from types import SimpleNamespace
+ from typing import Any, Iterable
+ 
+@@ -79,58 +80,192 @@ class StreamChunks(list):
+     """
+ 
+ 
+-def completion_to_stream_chunks(completion: SimpleNamespace) -> StreamChunks:
++def _extract_completion_extras(completion: Any) -> list[tuple[str, Any]]:
++    """Extract response-level attributes/extras without requiring __dict__."""
++    extras: dict[str, Any] = {}
++
++    # 1. Mapping (e.g. dict)
++    if isinstance(completion, Mapping):
++        for k, v in completion.items():
++            if isinstance(k, str) and k not in ("choices", "usage", "model"):
++                extras[k] = v
++        return list(extras.items())
++
++    # 2. Objects with __dict__ (SimpleNamespace, standard classes)
++    try:
++        raw_dict = getattr(completion, "__dict__", None)
++        if isinstance(raw_dict, dict):
++            for k, v in raw_dict.items():
++                if isinstance(k, str) and k not in ("choices", "usage", "model"):
++                    extras[k] = v
++    except Exception:
++        pass
++
++    # 3. Pydantic v2 __pydantic_extra__
++    try:
++        pyd_extra = getattr(completion, "__pydantic_extra__", None)
++        if isinstance(pyd_extra, dict):
++            for k, v in pyd_extra.items():
++                if isinstance(k, str) and k not in ("choices", "usage", "model"):
++                    extras.setdefault(k, v)
++    except Exception:
++        pass
++
++    # 4. model_dump / to_dict / dict
++    for dump_name in ("model_dump", "to_dict", "dict"):
++        dump_fn = getattr(completion, dump_name, None)
++        if callable(dump_fn):
++            try:
++                dumped = dump_fn()
++                if isinstance(dumped, dict):
++                    for k, v in dumped.items():
++                        if isinstance(k, str) and k not in ("choices", "usage", "model"):
++                            extras.setdefault(k, v)
++                    break
++            except Exception:
++                pass
++
++    # 5. __slots__
++    try:
++        slots = getattr(completion, "__slots__", None)
++        if slots:
++            if isinstance(slots, str):
++                slots = [slots]
++            for s in slots:
++                if (
++                    isinstance(s, str)
++                    and s not in ("choices", "usage", "model")
++                    and not s.startswith("_")
++                    and hasattr(completion, s)
++                ):
++                    extras.setdefault(s, getattr(completion, s))
++    except Exception:
++        pass
++
++    # 6. dir() / getattr() fallback for other public non-callable attributes
++    try:
++        for attr in dir(completion):
++            if attr.startswith("_") or attr in ("choices", "usage", "model") or attr in extras:
++                continue
++            try:
++                val = getattr(completion, attr)
++                if not callable(val):
++                    extras.setdefault(attr, val)
++            except Exception:
++                pass
++    except Exception:
++        pass
++
++    return list(extras.items())
++
++
++def completion_to_stream_chunks(completion: Any) -> StreamChunks:
+     """Convert a one-shot ACP response into OpenAI-style stream chunks.
+ 
+     Response-level attributes other than ``choices``/``usage``/``model`` are
+     copied onto the returned object so nothing a caller reads off the completion
+     is lost when it asked to stream.
+     """
+-    choice = completion.choices[0]
+-    message = choice.message
++    choices = getattr(completion, "choices", None)
++    if choices is None and isinstance(completion, Mapping):
++        choices = completion.get("choices")
++    choice = choices[0] if choices else None
++
++    if choice is None:
++        message = None
++        finish_reason = "stop"
++    else:
++        message = getattr(choice, "message", None)
++        if message is None and isinstance(choice, Mapping):
++            message = choice.get("message")
++        finish_reason = getattr(choice, "finish_reason", "stop")
++        if finish_reason is None and isinstance(choice, Mapping):
++            finish_reason = choice.get("finish_reason")
++
+     tool_call_deltas = None
+-    if message.tool_calls:
++    tool_calls = getattr(message, "tool_calls", None) if message is not None else None
++    if tool_calls is None and isinstance(message, Mapping):
++        tool_calls = message.get("tool_calls")
++
++    if tool_calls:
+         tool_call_deltas = []
+-        for index, tool_call in enumerate(message.tool_calls):
++        for index, tool_call in enumerate(tool_calls):
++            tc_id = getattr(tool_call, "id", None)
++            tc_type = getattr(tool_call, "type", "function")
++            tc_fn = getattr(tool_call, "function", None)
++            if isinstance(tool_call, Mapping):
++                if tc_id is None:
++                    tc_id = tool_call.get("id")
++                if tc_type is None:
++                    tc_type = tool_call.get("type", "function")
++                if tc_fn is None:
++                    tc_fn = tool_call.get("function")
++            fn_name = getattr(tc_fn, "name", None)
++            fn_args = getattr(tc_fn, "arguments", None)
++            if isinstance(tc_fn, Mapping):
++                if fn_name is None:
++                    fn_name = tc_fn.get("name")
++                if fn_args is None:
++                    fn_args = tc_fn.get("arguments")
++
+             tool_call_deltas.append(
+                 SimpleNamespace(
+                     index=index,
+-                    id=getattr(tool_call, "id", None),
+-                    type=getattr(tool_call, "type", "function"),
++                    id=tc_id,
++                    type=tc_type,
+                     function=SimpleNamespace(
+-                        name=getattr(tool_call.function, "name", None),
+-                        arguments=getattr(tool_call.function, "arguments", None),
++                        name=fn_name,
++                        arguments=fn_args,
+                     ),
+                 )
+             )
+ 
++    msg_content = getattr(message, "content", None) if message is not None else None
++    if msg_content is None and isinstance(message, Mapping):
++        msg_content = message.get("content")
++
++    reasoning_content = getattr(message, "reasoning_content", None) if message is not None else None
++    if reasoning_content is None and isinstance(message, Mapping):
++        reasoning_content = message.get("reasoning_content")
++
++    reasoning = getattr(message, "reasoning", None) if message is not None else None
++    if reasoning is None and isinstance(message, Mapping):
++        reasoning = message.get("reasoning")
++
+     delta = SimpleNamespace(
+         role="assistant",
+-        content=message.content or None,
++        content=msg_content or None,
+         tool_calls=tool_call_deltas,
+-        reasoning_content=getattr(message, "reasoning_content", None),
+-        reasoning=getattr(message, "reasoning", None),
++        reasoning_content=reasoning_content,
++        reasoning=reasoning,
+     )
++    model = getattr(completion, "model", None)
++    if model is None and isinstance(completion, Mapping):
++        model = completion.get("model")
++
++    usage = getattr(completion, "usage", None)
++    if usage is None and isinstance(completion, Mapping):
++        usage = completion.get("usage")
++
+     data_chunk = SimpleNamespace(
+         choices=[
+             SimpleNamespace(
+                 index=0,
+                 delta=delta,
+-                finish_reason=choice.finish_reason,
++                finish_reason=finish_reason,
+             )
+         ],
+-        model=completion.model,
++        model=model,
+         usage=None,
+     )
+     usage_chunk = SimpleNamespace(
+         choices=[],
+-        model=completion.model,
+-        usage=completion.usage,
++        model=model,
++        usage=usage,
+     )
+     chunks = StreamChunks([data_chunk, usage_chunk])
+-    for key, value in vars(completion).items():
+-        if key not in ("choices", "usage", "model"):
+-            setattr(chunks, key, value)
++    for key, value in _extract_completion_extras(completion):
++        setattr(chunks, key, value)
+     return chunks
+ 
+ 
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 2b7a336c80..cb922cfdb1 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -24,6 +24,7 @@ import re
+ import ssl
+ import sys
+ import time
++from collections.abc import Mapping
+ from typing import Any, Dict, List, Optional
+ 
+ from agent.codex_responses_adapter import _summarize_user_message_for_log
+@@ -3635,7 +3636,25 @@ def run_conversation(
+                     # Check for x-openrouter-provider or similar metadata
+                     if provider_name == "Unknown" and response:
+                         # Log all response attributes for debugging
+-                        resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
++                        resp_attrs = {}
++                        try:
++                            if isinstance(response, Mapping):
++                                _items = response.items()
++                            elif hasattr(response, "__dict__"):
++                                _items = vars(response).items()
++                            elif hasattr(response, "model_dump") and callable(response.model_dump):
++                                _items = response.model_dump().items()
++                            elif hasattr(response, "to_dict") and callable(response.to_dict):
++                                _items = response.to_dict().items()
++                            else:
++                                _items = [
++                                    (k, getattr(response, k))
++                                    for k in dir(response)
++                                    if not k.startswith('_') and not callable(getattr(response, k, None))
++                                ]
++                            resp_attrs = {str(k): str(v)[:100] for k, v in _items if not str(k).startswith('_')}
++                        except Exception:
++                            resp_attrs = {}
+                         if agent.verbose_logging:
+                             logging.debug(f"Response attributes for invalid response: {resp_attrs}")
+                     
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index 3764633db6..b5ad8ec0e2 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -20,6 +20,7 @@ import { sessionCompacting } from '@/store/compaction'
+ import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
+ import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
+ import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
++import { $backgroundStatusBySession, resolveBackgroundStatusSessionId } from '@/store/composer-status'
+ import { $hudMode } from '@/store/hud'
+ import { sessionBlockingPrompt } from '@/store/prompts'
+ import { toggleReview } from '@/store/review'
+@@ -174,10 +175,18 @@ export function ChatBar({
+   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
+   const activeQueueSessionKey = queueSessionKey || sessionId || null
+ 
+-  // Status items (subagents, background processes) are keyed by the RUNTIME
+-  // session id — gateway events and process.list both speak that id. Only the
+-  // queue uses the stored-session fallback key (prompts can queue pre-resume).
+-  const statusSessionId = sessionId ?? null
++  // Status items are keyed by runtime id, but messaging conversations can stay
++  // selected after their direct runtime prop is cleared. Resolve that runtime
++  // through the durable stored id so background rows do not disappear while
++  // their process continues running.
++  const statusSessionId = useStoresSelector([$sessionStates, $backgroundStatusBySession], () =>
++    resolveBackgroundStatusSessionId(
++      sessionId ?? null,
++      queueSessionKey ?? null,
++      $sessionStates.get(),
++      $backgroundStatusBySession.get()
++    )
++  )
+ 
+   const composerTourMarker = useTourMarker('composer')
+ 
+diff --git a/apps/desktop/src/app/chat/composer/status-stack/index.tsx b/apps/desktop/src/app/chat/composer/status-stack/index.tsx
+index 9e74590af8..c93d7582cf 100644
+--- a/apps/desktop/src/app/chat/composer/status-stack/index.tsx
++++ b/apps/desktop/src/app/chat/composer/status-stack/index.tsx
+@@ -20,6 +20,7 @@ import {
+   type ComposerStatusItem,
+   dismissBackgroundProcess,
+   groupStatusItems,
++  isSessionGone,
+   refreshBackgroundProcesses,
+   type StatusGroup,
+   stopBackgroundProcess
+@@ -33,9 +34,19 @@ import { PreviewStatusRow } from './preview-row'
+ import { StatusItemRow } from './status-row'
+ 
+ // Slow safety-net poll for silent exits (processes without notify_on_complete
+-// emit no event when they die). Only armed while a running row is on screen.
++// emit no event when they die). Armed while a running row is on screen.
+ const BACKGROUND_POLL_MS = 5_000
+ 
++// Idle cadence, armed whenever a live session is mounted with no background row
++// yet. A `terminal(background=true)` job spawned through ANOTHER gateway client
++// (Telegram, a second Desktop window, a CLI) only reaches this window through
++// the shared process registry — it broadcasts no event here — so without a poll
++// while the stack is empty the very first row is never discovered and the
++// 5s tick above, which only starts once a row already exists, never gets armed.
++// Slower than the running cadence: this is discovery, not liveness, and it runs
++// in every mounted tile.
++const BACKGROUND_DISCOVERY_POLL_MS = 15_000
++
+ // A localhost/loopback preview is only meaningful while its dev server is up, so
+ // we tie it to a live background process rather than persisting dismissals or
+ // letting dead URLs pile up. File previews (a real on-disk artifact) stand alone.
+@@ -122,15 +133,33 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
+   // dead `localhost:5174` chips stick around. On-disk file previews are kept.
+   const visiblePreviews = previews.filter(item => hasRunningBackground || !isLocalhostPreview(item.target))
+ 
++  // One timer, two cadences: fast while something is running (catch a silent
++  // exit), slow while the stack is empty (discover work created elsewhere).
++  // Changing `pollMs` re-runs the effect, which tears the old timer down first,
++  // so a session never holds two.
++  const pollMs = hasRunningBackground ? BACKGROUND_POLL_MS : BACKGROUND_DISCOVERY_POLL_MS
++
+   useEffect(() => {
+-    if (!sessionId || !hasRunningBackground) {
++    // The gone-latch still bounds this: a runtime id the gateway no longer
++    // holds answers 4001 forever, so we never arm against one, and a session
++    // that dies mid-poll takes its own timer down on the next tick. Discovery
++    // must not become the 4001 storm the latch exists to stop.
++    if (!sessionId || isSessionGone(sessionId)) {
+       return
+     }
+ 
+-    const timer = setInterval(() => void refreshBackgroundProcesses(sessionId), BACKGROUND_POLL_MS)
++    const timer = setInterval(() => {
++      if (isSessionGone(sessionId)) {
++        clearInterval(timer)
++
++        return
++      }
++
++      void refreshBackgroundProcesses(sessionId)
++    }, pollMs)
+ 
+     return () => clearInterval(timer)
+-  }, [hasRunningBackground, sessionId])
++  }, [pollMs, sessionId])
+ 
+   const openAgents = () => navigate(AGENTS_ROUTE)
+ 
+diff --git a/apps/desktop/src/store/composer-status.test.ts b/apps/desktop/src/store/composer-status.test.ts
+index d47103b0cb..0a8832fbd0 100644
+--- a/apps/desktop/src/store/composer-status.test.ts
++++ b/apps/desktop/src/store/composer-status.test.ts
+@@ -7,7 +7,8 @@ import {
+   isSessionGoneForBackgroundPolling,
+   reconcileBackgroundProcesses,
+   refreshBackgroundProcesses,
+-  resetBackgroundPollingGuard
++  resetBackgroundPollingGuard,
++  resolveBackgroundStatusSessionId
+ } from './composer-status'
+ import { $gateway } from './gateway'
+ 
+@@ -24,6 +25,31 @@ const exited = (id: string, exit_code = 0, command = `cmd ${id}`) => ({
+ 
+ const items = () => $backgroundStatusBySession.get()[SID] ?? []
+ 
++describe('resolveBackgroundStatusSessionId', () => {
++  const states = {
++    'runtime-telegram': { storedSessionId: 'stored-telegram' },
++    'runtime-other': { storedSessionId: 'stored-other' }
++  } as never
++
++  const background = {
++    'runtime-telegram': [
++      { id: 'proc-1', state: 'running' as const, title: 'tts', type: 'background' as const }
++    ]
++  }
++
++  it('uses the durable session when an idle messaging conversation has no runtime prop', () => {
++    expect(resolveBackgroundStatusSessionId(null, 'stored-telegram', states, background)).toBe('stored-telegram')
++  })
++
++  it('keeps an explicitly bound runtime authoritative', () => {
++    expect(resolveBackgroundStatusSessionId('runtime-live', 'stored-telegram', states, background)).toBe('runtime-live')
++  })
++
++  it('queries the durable session directly when no runtime mapping exists yet', () => {
++    expect(resolveBackgroundStatusSessionId(null, 'stored-missing', states, background)).toBe('stored-missing')
++  })
++})
++
+ describe('reconcileBackgroundProcesses', () => {
+   beforeEach(() => {
+     // Fake timers so the success self-clear (a real setTimeout) is deterministic
+diff --git a/apps/desktop/src/store/composer-status.ts b/apps/desktop/src/store/composer-status.ts
+index ce891688e5..e207528015 100644
+--- a/apps/desktop/src/store/composer-status.ts
++++ b/apps/desktop/src/store/composer-status.ts
+@@ -51,6 +51,34 @@ export interface ComposerStatusItem {
+ // registry (`terminal(background=true)` spawns) via `process.list`.
+ export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem[]>>({})
+ 
++/**
++ * Resolve the runtime key that owns a stored conversation's status rows.
++ *
++ * Messaging conversations can remain selected after their live runtime prop is
++ * cleared. Background registry rows still belong to that runtime, so falling
++ * straight to null hides work that the sidebar can already see through the
++ * runtime -> stored-session bridge.
++ */
++export function resolveBackgroundStatusSessionId(
++  runtimeId: null | string,
++  storedSessionId: null | string,
++  _states: Record<string, { storedSessionId?: null | string }>,
++  _background: Record<string, ComposerStatusItem[]>
++): null | string {
++  if (runtimeId) {
++    return runtimeId
++  }
++
++  if (!storedSessionId) {
++    return null
++  }
++
++  // With no live runtime prop, the durable conversation is authoritative.
++  // Runtime mappings may be stale after a messaging turn or compression, and
++  // choosing one here prevents process.list from reaching its durable fallback.
++  return storedSessionId
++}
++
+ // Stored session ids that have at least one RUNNING background process. The
+ // sidebar row reads this for a hollow dot — distinct from the filled dot of an
+ // active LLM turn — so the user can tell at a glance "this session has
+diff --git a/contributors/emails/agent@agents-Mac-mini.local b/contributors/emails/agent@agents-Mac-mini.local
+index 850e0a4eb0..73bf022af1 100644
+--- a/contributors/emails/agent@agents-Mac-mini.local
++++ b/contributors/emails/agent@agents-Mac-mini.local
+@@ -1 +1 @@
+-momomojo
++skip-agent
+diff --git a/tests/agent/test_acp_openai_bridge.py b/tests/agent/test_acp_openai_bridge.py
+index d1c0402604..21f5efd94f 100644
+--- a/tests/agent/test_acp_openai_bridge.py
++++ b/tests/agent/test_acp_openai_bridge.py
+@@ -186,6 +186,77 @@ def test_a_text_only_completion_streams_without_tool_call_deltas():
+     assert chunks[0].choices[0].delta.tool_calls is None
+ 
+ 
++def test_slotted_completion_without_dict_survives_stream_conversion():
++    """Completion objects without __dict__ (e.g. slotted models) must not raise
++    TypeError: vars() argument must have __dict__ attribute, and extras must survive."""
++    class _SlottedCompletion:
++        __slots__ = ("choices", "usage", "model", "hermes_projected_messages", "custom_extra")
++
++        def __init__(self):
++            message = SimpleNamespace(content="slotted hello", tool_calls=None, reasoning=None, reasoning_content=None)
++            self.choices = [SimpleNamespace(message=message, finish_reason="stop")]
++            self.usage = SimpleNamespace(total_tokens=7)
++            self.model = "slotted-acp"
++            self.hermes_projected_messages = [{"role": "user", "content": "test"}]
++            self.custom_extra = "extra_value"
++
++    completion = _SlottedCompletion()
++    assert not hasattr(completion, "__dict__")
++
++    chunks = completion_to_stream_chunks(completion)
++    assert isinstance(chunks, StreamChunks)
++    assert len(chunks) == 2
++    assert chunks[0].choices[0].delta.content == "slotted hello"
++    assert chunks[1].usage.total_tokens == 7
++    assert chunks.hermes_projected_messages == [{"role": "user", "content": "test"}]
++    assert chunks.custom_extra == "extra_value"
++
++
++def test_model_dump_completion_survives_stream_conversion():
++    """Objects providing model_dump() (such as Pydantic models) copy extra fields."""
++    class _PydanticLikeCompletion:
++        def __init__(self):
++            message = SimpleNamespace(content="pydantic hello", tool_calls=None, reasoning=None, reasoning_content=None)
++            self.choices = [SimpleNamespace(message=message, finish_reason="stop")]
++            self.usage = SimpleNamespace(total_tokens=4)
++            self.model = "pydantic-acp"
++
++        def model_dump(self):
++            return {
++                "choices": self.choices,
++                "usage": self.usage,
++                "model": self.model,
++                "hermes_projected_messages": [{"role": "assistant", "content": "proj"}],
++                "extra_meta": 42,
++            }
++
++    chunks = completion_to_stream_chunks(_PydanticLikeCompletion())
++    assert isinstance(chunks, StreamChunks)
++    assert chunks.hermes_projected_messages == [{"role": "assistant", "content": "proj"}]
++    assert chunks.extra_meta == 42
++
++
++def test_mapping_completion_survives_stream_conversion():
++    """Dictionary / Mapping completion objects are supported without error."""
++    dict_completion = {
++        "choices": [
++            {
++                "message": {"role": "assistant", "content": "dict hello", "tool_calls": None},
++                "finish_reason": "stop",
++            }
++        ],
++        "usage": {"total_tokens": 12},
++        "model": "dict-model",
++        "hermes_projected_messages": [{"role": "system", "content": "init"}],
++        "provider_tag": "custom_provider",
++    }
++    chunks = completion_to_stream_chunks(dict_completion)
++    assert isinstance(chunks, StreamChunks)
++    assert chunks[0].choices[0].delta.content == "dict hello"
++    assert chunks.hermes_projected_messages == [{"role": "system", "content": "init"}]
++    assert chunks.provider_tag == "custom_provider"
++
++
+ # ── the in-tree consumer still speaks the same wire ──────────────────────────
+ 
+ 
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 2c785027ac..c9301d1f8e 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -461,6 +461,8 @@ class ProcessRegistry:
+         self._running: Dict[str, ProcessSession] = {}
+         self._finished: Dict[str, ProcessSession] = {}
+         self._lock = threading.Lock()
++        self._checkpoint_output_lock = threading.Lock()
++        self._last_output_checkpoint_at = 0.0
+ 
+         # Side-channel for check_interval watchers (gateway reads after agent run)
+         self.pending_watchers: List[Dict[str, Any]] = []
+@@ -532,6 +534,15 @@ class ProcessRegistry:
+         except Exception:
+             pass
+ 
++    def _checkpoint_live_output(self) -> None:
++        """Publish process tails for peer gateway processes, at most 4Hz."""
++        now = time.monotonic()
++        with self._checkpoint_output_lock:
++            if now - self._last_output_checkpoint_at < 0.25:
++                return
++            self._last_output_checkpoint_at = now
++        self._write_checkpoint()
++
+     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
+         """Scan new output for watch patterns and queue notifications.
+ 
+@@ -1434,6 +1445,7 @@ class ProcessRegistry:
+                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
+             self._check_watch_patterns(session, chunk)
+             self._emit_output(session, chunk)
++            self._checkpoint_live_output()
+ 
+         try:
+             proc = session.process
+@@ -1547,6 +1559,7 @@ class ProcessRegistry:
+                     if delta:
+                         self._check_watch_patterns(session, delta)
+                         self._emit_output(session, delta)
++                        self._checkpoint_live_output()
+ 
+                 # Check if process is still running
+                 check = env.execute(
+@@ -1595,6 +1608,7 @@ class ProcessRegistry:
+                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
+             self._check_watch_patterns(session, text)
+             self._emit_output(session, text)
++            self._checkpoint_live_output()
+ 
+         try:
+             while pty.isalive():
+@@ -2840,6 +2854,11 @@ class ProcessRegistry:
+                             "parent_session_id": s.parent_session_id,
+                             "notify_on_complete": s.notify_on_complete,
+                             "watch_patterns": s.watch_patterns,
++                            # Peer gateways have separate Python heaps. Persist
++                            # a redacted rolling tail for shared Desktop logs.
++                            "output_tail": redact_sensitive_text(
++                                s.output_buffer[-s.max_output_chars:], code_file=True
++                            ),
+                         })
+                 if extra_entries:
+                     tracked_ids = {item.get("session_id") for item in entries}
+@@ -2855,6 +2874,62 @@ class ProcessRegistry:
+         except Exception as e:
+             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+ 
++    def sync_from_checkpoint(self) -> int:
++        """Import or refresh live processes owned by another gateway process.
++
++        Safe for repeated polling: locally-owned sessions are never replaced,
++        detached mirrors are updated in place, and readers never rewrite the
++        shared checkpoint.
++        """
++        if not CHECKPOINT_PATH.exists():
++            return 0
++        try:
++            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
++        except Exception:
++            return 0
++
++        added = 0
++        for entry in entries if isinstance(entries, list) else []:
++            process_id = str(entry.get("session_id") or "")
++            pid = entry.get("pid")
++            pid_scope = entry.get("pid_scope", "host")
++            recorded_start = entry.get("host_start_time")
++            if not process_id or not pid or pid_scope != "host":
++                continue
++            if not self._host_pid_is_ours(pid, recorded_start):
++                continue
++
++            with self._lock:
++                existing = self._running.get(process_id) or self._finished.get(process_id)
++            if existing is not None:
++                if existing.detached:
++                    with existing._lock:
++                        existing.output_buffer = str(entry.get("output_tail") or "")[-existing.max_output_chars:]
++                continue
++
++            session = ProcessSession(
++                id=process_id,
++                command=entry.get("command", "unknown"),
++                task_id=entry.get("task_id", ""),
++                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
++                session_key=entry.get("session_key", ""),
++                pid=pid,
++                host_start_time=recorded_start,
++                pid_scope=pid_scope,
++                systemd_unit=entry.get("systemd_unit", ""),
++                cwd=entry.get("cwd"),
++                started_at=entry.get("started_at", time.time()),
++                output_buffer=str(entry.get("output_tail") or "")[-MAX_OUTPUT_CHARS:],
++                detached=True,
++                parent_session_id=entry.get("parent_session_id", ""),
++                # The owner gateway remains solely responsible for delivery.
++                notify_on_complete=False,
++            )
++            with self._lock:
++                self._running[session.id] = session
++            added += 1
++        return added
++
+     def recover_from_checkpoint(self) -> int:
+         """
+         On gateway startup, probe PIDs from checkpoint file.
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 7d72f7e37b..e49deb68ef 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -10,6 +10,11 @@ _registry = HandlerRegistry()
+ method = _registry.method
+ _profile_scoped = _registry.profile_scoped
+ 
++# ``_process_scope_session`` (used by process.list / process.kill below) is
++# defined on server.py's namespace, not here: these handler bodies are rebound
++# onto server's globals at install time (method_ctx.HandlerRegistry.install), so
++# a plain module-level def here is unreachable from them — same as _ok/_err.
++
+ 
+ @method("system.battery")
+ def _(rid, params: dict) -> dict:
+@@ -49,7 +54,7 @@ def _(rid, params: dict) -> dict:
+ @method("process.list")
+ def _(rid, params: dict) -> dict:
+     """Session-scoped view of the background process registry (desktop status stack)."""
+-    session, err = _sess(params, rid)
++    session, err = _process_scope_session(params, rid)
+     if err:
+         return err
+     try:
+@@ -62,7 +67,7 @@ def _(rid, params: dict) -> dict:
+ def _(rid, params: dict) -> dict:
+     """Kill ONE background process — scoped to the caller's session so one
+     window can't reap another session's work (unlike process.stop's kill_all)."""
+-    session, err = _sess(params, rid)
++    session, err = _process_scope_session(params, rid)
+     if err:
+         return err
+     proc_id = str(params.get("process_id") or "")
+@@ -72,9 +77,7 @@ def _(rid, params: dict) -> dict:
+         from tools.process_registry import process_registry
+ 
+         proc = process_registry.get(proc_id)
+-        if proc is None or str(getattr(proc, "session_key", "") or "") != str(
+-            session.get("session_key") or ""
+-        ):
++        if proc is None or not _process_owned_by_session(proc, str(session.get("session_key") or "")):
+             return _err(rid, 4044, f"no such process: {proc_id}")
+         return _ok(rid, process_registry.kill_process(proc_id))
+     except Exception as e:
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 5f5c8249b4..5588b539d8 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -15524,15 +15524,58 @@ def _build_project_tree(
+ # ── Methods: tools & system ──────────────────────────────────────────
+ 
+ 
++def _process_owned_by_session(proc, session_key: str) -> bool:
++    """Whether a process belongs to a live or durable view of a conversation.
++
++    Gateway-originated messaging tools use a routing key for reset protection,
++    while ``owner_task_id`` is the durable session-db id exposed to Desktop.
++    Accept either identity (plus the explicit completion parent) so a Telegram
++    process remains visible after the originating runtime turn is gone.
++    """
++    key = str(session_key or "")
++    if not key:
++        return False
++    return key in {
++        str(getattr(proc, "session_key", "") or ""),
++        str(getattr(proc, "owner_task_id", "") or ""),
++        str(getattr(proc, "parent_session_id", "") or ""),
++    }
++
++
++def _process_scope_session(params: dict, rid):
++    """Resolve live runtime scope, falling back to a durable conversation id.
++
++    Desktop can render a messaging conversation without a live runtime row.
++    Background ownership is still checked against the durable id by
++    :func:`_process_owned_by_session`; only the generic runtime lookup is
++    skipped.
++
++    Lives on THIS namespace so the rebound process.list / process.kill handler
++    bodies in methods_tools can resolve it, same as ``_ok``/``_err``.
++    """
++    session, err = _sess(params, rid)
++    if not err:
++        return session, None
++
++    durable_id = str(params.get("session_id") or "")
++    if not durable_id:
++        return None, err
++    return {"session_key": durable_id}, None
++
++
+ def _session_processes(session: dict) -> list:
+-    """Background processes owned by this session (registry session_key match)."""
++    """Background processes owned by this runtime or durable conversation."""
+     from tools.process_registry import process_registry
+ 
++    # Desktop and messaging can run in separate gateway processes. Pull live
++    # metadata/output mirrors from the shared checkpoint before filtering.
++    process_registry.sync_from_checkpoint()
++
+     key = str(session.get("session_key") or "")
+     owned = []
+     for entry in process_registry.list_sessions():
+         proc = process_registry.get(entry["session_id"])
+-        if proc is None or str(getattr(proc, "session_key", "") or "") != key:
++        if proc is None or not _process_owned_by_session(proc, key):
+             continue
+         # The 200-char list preview is too thin for the desktop's inline
+         # terminal viewer — ship a real tail alongside it.

@@ -3054,19 +3054,69 @@ def _respond(rid, params, key, *, allow_expired=False):
 # ── Methods: tools & system ──────────────────────────────────────────
 
 
+def _process_owned_by_session(proc, session_key: str) -> bool:
+    """Whether a process belongs to a live or durable conversation view."""
+    key = str(session_key or "")
+    if not key:
+        return False
+    return key in {
+        str(getattr(proc, "session_key", "") or ""),
+        str(getattr(proc, "owner_task_id", "") or ""),
+        str(getattr(proc, "parent_session_id", "") or ""),
+    }
+
+
+def _is_missing_runtime_error(err: dict) -> bool:
+    """Check if error is a genuine missing-runtime error (4001 session not found).
+    Other errors (auth, validation) must not trigger durable scope fallback."""
+    if not isinstance(err, dict):
+        return False
+    # Error structure can be {"error": {"code": 4001}} or {"code": 4001}
+    error_obj = err.get("error", err)
+    return isinstance(error_obj, dict) and error_obj.get("code") == 4001
+
+
+def _process_scope_session(params: dict, rid):
+    """Resolve a runtime scope, falling back to its durable conversation id.
+
+    The durable fallback only applies when _sess fails with a genuine missing-runtime
+    error (4001). Other errors (auth, malformed params) propagate. The durable_id must
+    be a valid session identifier (non-empty string matching session_id format) to prevent
+    cross-session process access via crafted session_id values.
+    """
+    session, err = _sess(params, rid)
+    if not err:
+        return session, None
+
+    # Only fall back to durable scope for genuine missing-runtime errors.
+    # Other errors (auth, validation) must propagate.
+    if not _is_missing_runtime_error(err):
+        return None, err
+
+    durable_id = str(params.get("session_id") or "").strip()
+    if not durable_id:
+        return None, err
+    # Validate session_id format: must be a non-empty string without control characters
+    # to prevent injection or cross-session access via malformed IDs.
+    if any(ord(c) < 32 for c in durable_id):
+        return None, err
+    return {"session_key": durable_id}, None
+
+
 def _session_processes(session: dict) -> list:
-    """Background processes owned by this session (registry session_key match)."""
+    """Background processes owned by this runtime or durable conversation."""
     # Drain completion notifications that arrived during this turn. The background poller handles
     # between-turn delivery; this is the safety net for events that arrived mid-turn. Ownership filter
     # (#42674, #35652): a turn finishing in session B must not consume an event that belongs to session A.
     # The registry requeues every addressed event this session cannot positively claim; the poller then
     # delivers it to a live owner or drops an orphan.
     from tools.process_registry import process_registry
+    process_registry.sync_from_checkpoint()
     key = str(session.get("session_key") or "")
     owned = []
     for entry in process_registry.list_sessions():
         proc = process_registry.get(entry["session_id"])
-        if proc is not None and str(getattr(proc, "session_key", "") or "") == key:
+        if proc is not None and _process_owned_by_session(proc, key):
             entry["output_tail"] = (proc.output_buffer or "")[-4000:]  # the 200-char list preview is too thin for the viewer
             owned.append(entry)
     return owned

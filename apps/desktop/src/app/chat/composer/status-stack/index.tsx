@@ -20,6 +20,7 @@ import {
   type ComposerStatusItem,
   dismissBackgroundProcess,
   groupStatusItems,
+  isSessionGone,
   refreshBackgroundProcesses,
   type StatusGroup,
   stopBackgroundProcess
@@ -33,8 +34,18 @@ import { PreviewStatusRow } from './preview-row'
 import { StatusItemRow } from './status-row'
 
 // Slow safety-net poll for silent exits (processes without notify_on_complete
-// emit no event when they die). Only armed while a running row is on screen.
+// emit no event when they die). Armed while a running row is on screen.
 const BACKGROUND_POLL_MS = 5_000
+
+// Idle cadence, armed whenever a live session is mounted with no background row
+// yet. A `terminal(background=true)` job spawned through ANOTHER gateway client
+// (Telegram, a second Desktop window, a CLI) only reaches this window through
+// the shared process registry — it broadcasts no event here — so without a poll
+// while the stack is empty the very first row is never discovered and the
+// 5s tick above, which only starts once a row already exists, never gets armed.
+// Slower than the running cadence: this is discovery, not liveness, and it runs
+// in every mounted tile.
+const BACKGROUND_DISCOVERY_POLL_MS = 15_000
 
 // A localhost/loopback preview is only meaningful while its dev server is up, so
 // we tie it to a live background process rather than persisting dismissals or
@@ -122,15 +133,33 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   // dead `localhost:5174` chips stick around. On-disk file previews are kept.
   const visiblePreviews = previews.filter(item => hasRunningBackground || !isLocalhostPreview(item.target))
 
+  // One timer, two cadences: fast while something is running (catch a silent
+  // exit), slow while the stack is empty (discover work created elsewhere).
+  // Changing `pollMs` re-runs the effect, which tears the old timer down first,
+  // so a session never holds two.
+  const pollMs = hasRunningBackground ? BACKGROUND_POLL_MS : BACKGROUND_DISCOVERY_POLL_MS
+
   useEffect(() => {
-    if (!sessionId || !hasRunningBackground) {
+    // The gone-latch still bounds this: a runtime id the gateway no longer
+    // holds answers 4001 forever, so we never arm against one, and a session
+    // that dies mid-poll takes its own timer down on the next tick. Discovery
+    // must not become the 4001 storm the latch exists to stop.
+    if (!sessionId || isSessionGone(sessionId)) {
       return
     }
 
-    const timer = setInterval(() => void refreshBackgroundProcesses(sessionId), BACKGROUND_POLL_MS)
+    const timer = setInterval(() => {
+      if (isSessionGone(sessionId)) {
+        clearInterval(timer)
+
+        return
+      }
+
+      void refreshBackgroundProcesses(sessionId)
+    }, pollMs)
 
     return () => clearInterval(timer)
-  }, [hasRunningBackground, sessionId])
+  }, [pollMs, sessionId])
 
   const openAgents = () => navigate(AGENTS_ROUTE)
 

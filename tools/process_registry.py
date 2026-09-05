@@ -397,6 +397,8 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._checkpoint_output_lock = threading.Lock()
+        self._last_output_checkpoint_at = 0.0
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -444,6 +446,15 @@ class ProcessRegistry:
             return
         with suppress(Exception):
             sink(session, chunk)
+
+    def _checkpoint_live_output(self) -> None:
+        """Publish process tails for peer gateway processes, at most 4Hz."""
+        now = time.monotonic()
+        with self._checkpoint_output_lock:
+            if now - self._last_output_checkpoint_at < 0.25:
+                return
+            self._last_output_checkpoint_at = now
+        self._write_checkpoint()
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan a freshly-read chunk for watch patterns and queue notifications.
@@ -1091,6 +1102,7 @@ class ProcessRegistry:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     self._check_watch_patterns(session, delta)
                     self._emit_output(session, delta)
+                    self._checkpoint_live_output()
 
                 check = env.execute(
                     f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?", timeout=5)
@@ -1141,6 +1153,7 @@ class ProcessRegistry:
         session.append_output(text)
         self._check_watch_patterns(session, text)
         self._emit_output(session, text)
+        self._checkpoint_live_output()
 
     def _finish_exited(self, session: ProcessSession, exit_code) -> None:
         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish."""
@@ -1891,9 +1904,15 @@ class ProcessRegistry:
                     # Redact inline credentials before persisting (~/.hermes/processes.json).
                     # Recovery uses command only for display (adoption re-validates the
                     # PID, never re-runs it), so masking is lossless.
+                    # force=True ensures redaction runs even if security.redact_secrets is disabled.
+                    # code_file=False allows ENV/JSON assignment redaction (PASSWORD=..., JSON credentials).
                     # See #77484.
-                    entry["command"] = redact_sensitive_text(s.command, code_file=True)
+                    entry["command"] = redact_sensitive_text(s.command, force=True, code_file=False)
                     entry["owner_task_id"] = s.owner_task_id or s.task_id
+                    # Gateways have separate Python heaps. Persist a redacted
+                    # rolling tail so peer Desktop clients can render live logs.
+                    entry["output_tail"] = redact_sensitive_text(
+                        s.output_buffer[-s.max_output_chars:], force=True, code_file=False)
                     entries.append(entry)
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
@@ -1902,6 +1921,64 @@ class ProcessRegistry:
             atomic_json_write(CHECKPOINT_PATH, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+
+    def sync_from_checkpoint(self) -> int:
+        """Import or refresh live processes owned by another gateway process.
+
+        Repeated polling never replaces locally-owned sessions or rewrites the
+        shared checkpoint. Detached mirrors only receive already-redacted tails.
+        """
+        if not CHECKPOINT_PATH.exists():
+            return 0
+        try:
+            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+
+        added = 0
+        for entry in entries if isinstance(entries, list) else []:
+            process_id = str(entry.get("session_id") or "")
+            pid = entry.get("pid")
+            pid_scope = entry.get("pid_scope", "host")
+            recorded_start = entry.get("host_start_time")
+            # Require host_start_time to prevent PID-recycled adoption attacks.
+            # Without start_time identity, _host_pid_is_ours degrades to bare liveness
+            # and a stale checkpoint could kill an unrelated process.
+            if not process_id or not pid or pid_scope != "host" or not recorded_start:
+                continue
+            if not self._host_pid_is_ours(pid, recorded_start):
+                continue
+
+            with self._lock:
+                existing = self._running.get(process_id) or self._finished.get(process_id)
+            if existing is not None:
+                if existing.detached:
+                    with existing._lock:
+                        existing.output_buffer = str(entry.get("output_tail") or "")[-existing.max_output_chars:]
+                continue
+
+            session = ProcessSession(
+                id=process_id,
+                command=entry.get("command", "unknown"),
+                task_id=entry.get("task_id", ""),
+                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+                session_key=entry.get("session_key", ""),
+                pid=pid,
+                host_start_time=recorded_start,
+                pid_scope=pid_scope,
+                systemd_unit=entry.get("systemd_unit", ""),
+                cwd=entry.get("cwd"),
+                started_at=entry.get("started_at", time.time()),
+                output_buffer=str(entry.get("output_tail") or "")[-MAX_OUTPUT_CHARS:],
+                detached=True,
+                parent_session_id=entry.get("parent_session_id", ""),
+                # The owner gateway remains solely responsible for delivery.
+                notify_on_complete=False,
+            )
+            with self._lock:
+                self._running[session.id] = session
+            added += 1
+        return added
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many

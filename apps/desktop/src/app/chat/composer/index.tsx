@@ -175,10 +175,9 @@ export function ChatBar({
   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
   const activeQueueSessionKey = queueSessionKey || sessionId || null
 
-  // Status items (subagents, background processes) are keyed by the RUNTIME
-  // session id — gateway events and process.list both speak that id. Only the
-  // queue uses the stored-session fallback key (prompts can queue pre-resume).
-  const statusSessionId = sessionId ?? null
+  // Prefer the live runtime, but keep an idle messaging conversation bound to
+  // its durable key so process.list can use the backend's durable fallback.
+  const statusSessionId = sessionId ?? queueSessionKey ?? null
 
   const composerTourMarker = useTourMarker('composer')
 

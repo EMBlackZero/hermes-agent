@@ -1,0 +1,669 @@
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index b01381e4..44e06100 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -175,10 +175,9 @@ export function ChatBar({
+   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
+   const activeQueueSessionKey = queueSessionKey || sessionId || null
+ 
+-  // Status items (subagents, background processes) are keyed by the RUNTIME
+-  // session id — gateway events and process.list both speak that id. Only the
+-  // queue uses the stored-session fallback key (prompts can queue pre-resume).
+-  const statusSessionId = sessionId ?? null
++  // Prefer the live runtime, but keep an idle messaging conversation bound to
++  // its durable key so process.list can use the backend's durable fallback.
++  const statusSessionId = sessionId ?? queueSessionKey ?? null
+ 
+   const composerTourMarker = useTourMarker('composer')
+ 
+diff --git a/apps/desktop/src/app/chat/composer/status-stack/background-discovery.test.tsx b/apps/desktop/src/app/chat/composer/status-stack/background-discovery.test.tsx
+new file mode 100644
+index 00000000..ab99b766
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/status-stack/background-discovery.test.tsx
+@@ -0,0 +1,146 @@
++import { act, cleanup, render, screen } from '@testing-library/react'
++import { MemoryRouter } from 'react-router'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { $backgroundStatusBySession, resetBackgroundPollingGuard } from '@/store/composer-status'
++import { $gateway } from '@/store/gateway'
++
++import { ComposerStatusStack } from './index'
++
++// The stack measures itself into a surface var — jsdom has no ResizeObserver.
++class ResizeObserverStub {
++  observe() {}
++  unobserve() {}
++  disconnect() {}
++}
++
++vi.stubGlobal('ResizeObserver', ResizeObserverStub)
++
++const SID = 'sess-discovery'
++
++// Long enough to cross the idle discovery cadence whatever it is tuned to,
++// short enough that the fake clock stays cheap.
++const PAST_ONE_DISCOVERY_TICK_MS = 30_000
++
++function renderStack() {
++  return render(
++    <MemoryRouter>
++      <ComposerStatusStack queue={null} sessionId={SID} />
++    </MemoryRouter>
++  )
++}
++
++// A background process spawned through ANOTHER gateway client (a Telegram
++// terminal(background=true) job) reaches this Desktop only through the shared
++// registry — no gateway event is broadcast to us. If the mounted session had no
++// background row at mount time, nothing ever asked the registry again, so the
++// row never appeared until the user remounted the tile.
++describe('ComposerStatusStack externally-created background discovery', () => {
++  beforeEach(() => {
++    vi.useFakeTimers()
++    resetBackgroundPollingGuard()
++    $backgroundStatusBySession.set({})
++  })
++
++  afterEach(() => {
++    cleanup()
++    vi.useRealTimers()
++    $gateway.set(null as never)
++    $backgroundStatusBySession.set({})
++    resetBackgroundPollingGuard()
++  })
++
++  it('discovers a process that appears on a later poll, with no remount and no gateway event', async () => {
++    let processes: Record<string, unknown>[] = []
++
++    const request = vi.fn(async (method: string) => (method === 'process.list' ? { processes } : {}))
++
++    $gateway.set({ request } as never)
++
++    renderStack()
++
++    // Mount seed: the registry is still empty, exactly like the reported bug
++    // (the Desktop tile opened minutes before the Telegram job started).
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(0)
++    })
++
++    expect(screen.queryByText('1 Background')).toBeNull()
++
++    // The job starts elsewhere. Nothing notifies this window.
++    processes = [{ command: 'sleep 600', session_id: 'proc_e99debacd2eb', status: 'running' }]
++
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(PAST_ONE_DISCOVERY_TICK_MS)
++    })
++
++    expect(screen.getByText('1 Background')).toBeTruthy()
++  })
++
++  it('stops polling after unmount so no timer leaks', async () => {
++    const request = vi.fn(async (method: string) => (method === 'process.list' ? { processes: [] } : {}))
++
++    $gateway.set({ request } as never)
++
++    const view = renderStack()
++
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(PAST_ONE_DISCOVERY_TICK_MS)
++    })
++
++    const callsWhileMounted = request.mock.calls.filter(([method]) => method === 'process.list').length
++
++    expect(callsWhileMounted).toBeGreaterThan(1)
++
++    view.unmount()
++
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(PAST_ONE_DISCOVERY_TICK_MS * 2)
++    })
++
++    expect(request.mock.calls.filter(([method]) => method === 'process.list').length).toBe(callsWhileMounted)
++  })
++
++  it('arms exactly one discovery timer per session and drops it on session switch', async () => {
++    const request = vi.fn(async (method: string, _params?: { session_id?: string }) =>
++      method === 'process.list' ? { processes: [] } : {}
++    )
++
++    const listCallsFor = (sid: string) =>
++      request.mock.calls.filter(([method, params]) => method === 'process.list' && params?.session_id === sid).length
++
++    $gateway.set({ request } as never)
++
++    const view = render(
++      <MemoryRouter>
++        <ComposerStatusStack queue={null} sessionId={SID} />
++      </MemoryRouter>
++    )
++
++    // A parent re-render with the SAME session must not stack a second timer.
++    view.rerender(
++      <MemoryRouter>
++        <ComposerStatusStack queue={null} sessionId={SID} />
++      </MemoryRouter>
++    )
++
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(PAST_ONE_DISCOVERY_TICK_MS)
++    })
++
++    const firstSessionCalls = listCallsFor(SID)
++
++    view.rerender(
++      <MemoryRouter>
++        <ComposerStatusStack queue={null} sessionId="sess-other" />
++      </MemoryRouter>
++    )
++
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(PAST_ONE_DISCOVERY_TICK_MS)
++    })
++
++    // The old session's timer is gone: its call count is frozen.
++    expect(listCallsFor(SID)).toBe(firstSessionCalls)
++  })
++})
+diff --git a/apps/desktop/src/app/chat/composer/status-stack/index.tsx b/apps/desktop/src/app/chat/composer/status-stack/index.tsx
+index 9e74590a..c93d7582 100644
+--- a/apps/desktop/src/app/chat/composer/status-stack/index.tsx
++++ b/apps/desktop/src/app/chat/composer/status-stack/index.tsx
+@@ -20,6 +20,7 @@ import {
+   type ComposerStatusItem,
+   dismissBackgroundProcess,
+   groupStatusItems,
++  isSessionGone,
+   refreshBackgroundProcesses,
+   type StatusGroup,
+   stopBackgroundProcess
+@@ -33,9 +34,19 @@ import { PreviewStatusRow } from './preview-row'
+ import { StatusItemRow } from './status-row'
+ 
+ // Slow safety-net poll for silent exits (processes without notify_on_complete
+-// emit no event when they die). Only armed while a running row is on screen.
++// emit no event when they die). Armed while a running row is on screen.
+ const BACKGROUND_POLL_MS = 5_000
+ 
++// Idle cadence, armed whenever a live session is mounted with no background row
++// yet. A `terminal(background=true)` job spawned through ANOTHER gateway client
++// (Telegram, a second Desktop window, a CLI) only reaches this window through
++// the shared process registry — it broadcasts no event here — so without a poll
++// while the stack is empty the very first row is never discovered and the
++// 5s tick above, which only starts once a row already exists, never gets armed.
++// Slower than the running cadence: this is discovery, not liveness, and it runs
++// in every mounted tile.
++const BACKGROUND_DISCOVERY_POLL_MS = 15_000
++
+ // A localhost/loopback preview is only meaningful while its dev server is up, so
+ // we tie it to a live background process rather than persisting dismissals or
+ // letting dead URLs pile up. File previews (a real on-disk artifact) stand alone.
+@@ -122,15 +133,33 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
+   // dead `localhost:5174` chips stick around. On-disk file previews are kept.
+   const visiblePreviews = previews.filter(item => hasRunningBackground || !isLocalhostPreview(item.target))
+ 
++  // One timer, two cadences: fast while something is running (catch a silent
++  // exit), slow while the stack is empty (discover work created elsewhere).
++  // Changing `pollMs` re-runs the effect, which tears the old timer down first,
++  // so a session never holds two.
++  const pollMs = hasRunningBackground ? BACKGROUND_POLL_MS : BACKGROUND_DISCOVERY_POLL_MS
++
+   useEffect(() => {
+-    if (!sessionId || !hasRunningBackground) {
++    // The gone-latch still bounds this: a runtime id the gateway no longer
++    // holds answers 4001 forever, so we never arm against one, and a session
++    // that dies mid-poll takes its own timer down on the next tick. Discovery
++    // must not become the 4001 storm the latch exists to stop.
++    if (!sessionId || isSessionGone(sessionId)) {
+       return
+     }
+ 
+-    const timer = setInterval(() => void refreshBackgroundProcesses(sessionId), BACKGROUND_POLL_MS)
++    const timer = setInterval(() => {
++      if (isSessionGone(sessionId)) {
++        clearInterval(timer)
++
++        return
++      }
++
++      void refreshBackgroundProcesses(sessionId)
++    }, pollMs)
+ 
+     return () => clearInterval(timer)
+-  }, [hasRunningBackground, sessionId])
++  }, [pollMs, sessionId])
+ 
+   const openAgents = () => navigate(AGENTS_ROUTE)
+ 
+diff --git a/tests/tools/test_process_registry_shared_checkpoint.py b/tests/tools/test_process_registry_shared_checkpoint.py
+new file mode 100644
+index 00000000..1febfb24
+--- /dev/null
++++ b/tests/tools/test_process_registry_shared_checkpoint.py
+@@ -0,0 +1,69 @@
++import json
++import time
++
++from tools import process_registry as registry_module
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++SECRET = "sk-proj-" + ("a" * 40)
++
++
++def _entry(process_id="proc_shared", output="first"):
++    return {
++        "session_id": process_id,
++        "command": "python worker.py",
++        "pid": 4242,
++        "pid_scope": "host",
++        "host_start_time": 123,
++        "cwd": "C:/work",
++        "started_at": time.time(),
++        "task_id": "session:telegram",
++        "owner_task_id": "stored-telegram",
++        "session_key": "agent:main:telegram:dm:1",
++        "parent_session_id": "",
++        "notify_on_complete": True,
++        "watch_patterns": [],
++        "output_tail": output,
++    }
++
++
++def test_sync_from_shared_checkpoint_imports_and_refreshes_foreign_output(tmp_path, monkeypatch):
++    checkpoint = tmp_path / "processes.json"
++    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", checkpoint)
++
++    peer = ProcessRegistry()
++    monkeypatch.setattr(peer, "_host_pid_is_ours", lambda _pid, _start: True)
++
++    checkpoint.write_text(json.dumps([_entry(output="first")]), encoding="utf-8")
++    assert peer.sync_from_checkpoint() == 1
++    session = peer.get("proc_shared")
++    assert session is not None
++    assert session.detached is True
++    assert session.output_buffer == "first"
++    assert session.owner_task_id == "stored-telegram"
++
++    checkpoint.write_text(json.dumps([_entry(output="second")]), encoding="utf-8")
++    assert peer.sync_from_checkpoint() == 0
++    assert peer.get("proc_shared").output_buffer == "second"
++
++
++def test_checkpoint_persists_output_tail_for_peer_gateways(tmp_path, monkeypatch):
++    checkpoint = tmp_path / "processes.json"
++    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", checkpoint)
++
++    owner = ProcessRegistry()
++    session = ProcessSession(
++        id="proc_shared",
++        command="python worker.py",
++        pid=4242,
++        host_start_time=123,
++        started_at=time.time(),
++        output_buffer=f"visible log OPENAI_API_KEY={SECRET}",
++    )
++    owner._running[session.id] = session
++    monkeypatch.setattr(owner, "_safe_host_start_time", lambda _pid: 123)
++
++    owner._write_checkpoint()
++
++    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
++    assert payload[0]["output_tail"].startswith("visible log")
++    assert SECRET not in payload[0]["output_tail"]
+diff --git a/tests/tui_gateway/test_handler_globals_resolve.py b/tests/tui_gateway/test_handler_globals_resolve.py
+new file mode 100644
+index 00000000..16376912
+--- /dev/null
++++ b/tests/tui_gateway/test_handler_globals_resolve.py
+@@ -0,0 +1,55 @@
++"""Every rebound @method handler must resolve all of its global names.
++
++Handlers defined in the ``methods_*`` split modules are rebound onto
++``tui_gateway.server``'s globals at install time (see
++``method_ctx.HandlerRegistry.install``), so a plain module-level def in a
++``methods_*`` module is invisible to its own handler bodies and blows up with
++``NameError`` on the first call. Unit tests that import the helper from its
++defining module do not catch this — they exercise a namespace that never
++exists in production. This walks the real bytecode instead.
++"""
++
++import builtins
++import dis
++
++from tui_gateway import server
++
++
++def _global_loads(code, seen=None):
++    """Every LOAD_GLOBAL name in ``code`` and its nested code objects."""
++    if seen is None:
++        seen = set()
++    for ins in dis.get_instructions(code):
++        if ins.opname == "LOAD_GLOBAL":
++            seen.add(ins.argval)
++    for const in code.co_consts:
++        if hasattr(const, "co_names"):
++            _global_loads(const, seen)
++    return seen
++
++
++def test_every_registered_handler_resolves_its_globals():
++    namespace = vars(server)
++    unresolved = []
++
++    for method_name, fn in sorted(server._methods.items()):
++        code = getattr(fn, "__code__", None)
++        if code is None:  # decorated (e.g. _profile_scoped) — unwrap
++            code = getattr(getattr(fn, "__wrapped__", None), "__code__", None)
++        if code is None:
++            continue
++        for name in _global_loads(code):
++            if name not in namespace and not hasattr(builtins, name):
++                unresolved.append(f"{method_name} -> {name}")
++
++    assert not unresolved, (
++        "handler bodies reference names missing from tui_gateway.server's "
++        "globals; define them on server.py (like _ok/_err) or import them at "
++        "call time:\n  " + "\n  ".join(unresolved)
++    )
++
++
++def test_process_scope_helpers_live_on_the_server_namespace():
++    """Regression: these two were defined in methods_tools and unreachable."""
++    assert callable(getattr(server, "_process_scope_session", None))
++    assert callable(getattr(server, "_process_owned_by_session", None))
+diff --git a/tests/tui_gateway/test_process_status_scope.py b/tests/tui_gateway/test_process_status_scope.py
+new file mode 100644
+index 00000000..477cb57d
+--- /dev/null
++++ b/tests/tui_gateway/test_process_status_scope.py
+@@ -0,0 +1,81 @@
++from types import SimpleNamespace
++
++from tools.process_registry import process_registry
++from tui_gateway import server
++
++
++def test_session_processes_accepts_durable_owner_when_gateway_routing_key_differs(monkeypatch):
++    """Telegram processes must remain visible from the desktop's stored session."""
++    entry = {"session_id": "proc_telegram", "status": "running"}
++    proc = SimpleNamespace(
++        session_key="agent:main:telegram:dm:5944283363",
++        owner_task_id="stored-telegram",
++        parent_session_id="",
++        output_buffer="working",
++    )
++
++    monkeypatch.setattr(process_registry, "list_sessions", lambda: [entry.copy()])
++    monkeypatch.setattr(process_registry, "get", lambda _process_id: proc)
++
++    assert server._session_processes({"session_key": "stored-telegram"}) == [
++        {"session_id": "proc_telegram", "status": "running", "output_tail": "working"}
++    ]
++
++
++def test_session_processes_does_not_cross_durable_session_boundaries(monkeypatch):
++    entry = {"session_id": "proc_other", "status": "running"}
++    proc = SimpleNamespace(
++        session_key="agent:main:telegram:dm:other",
++        owner_task_id="stored-other",
++        parent_session_id="stored-other",
++        output_buffer="private",
++    )
++
++    monkeypatch.setattr(process_registry, "list_sessions", lambda: [entry.copy()])
++    monkeypatch.setattr(process_registry, "get", lambda _process_id: proc)
++
++    assert server._session_processes({"session_key": "stored-telegram"}) == []
++
++
++def test_process_scope_falls_back_to_durable_session_id(monkeypatch):
++    expected_error = {"error": {"code": 404}}
++    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (None, expected_error), raising=False)
++
++    session, error = server._process_scope_session(
++        {"session_id": "stored-telegram"},
++        "request-1",
++    )
++
++    assert error is None
++    assert session == {"session_key": "stored-telegram"}
++
++
++def test_process_scope_keeps_missing_session_id_error(monkeypatch):
++    expected_error = {"error": {"code": 404}}
++    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (None, expected_error), raising=False)
++
++    session, error = server._process_scope_session({}, "request-1")
++
++    assert session is None
++    assert error is expected_error
++
++
++def test_process_kill_syncs_peer_registry_and_accepts_durable_owner(monkeypatch):
++    proc = SimpleNamespace(
++        session_key="agent:main:telegram:dm:5944283363",
++        owner_task_id="stored-telegram",
++        parent_session_id="",
++    )
++    synced = []
++    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (None, {"error": {"code": 4001}}))
++    monkeypatch.setattr(process_registry, "sync_from_checkpoint", lambda: synced.append(True))
++    monkeypatch.setattr(process_registry, "get", lambda _process_id: proc)
++    monkeypatch.setattr(process_registry, "kill_process", lambda process_id: {"status": "killed", "session_id": process_id})
++
++    response = server._methods["process.kill"](
++        "request-1",
++        {"session_id": "stored-telegram", "process_id": "proc_telegram"},
++    )
++
++    assert synced == [True]
++    assert response["result"] == {"status": "killed", "session_id": "proc_telegram"}
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 75ae003b..1e8aff5f 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -397,6 +397,8 @@ class ProcessRegistry:
+         self._running: Dict[str, ProcessSession] = {}
+         self._finished: Dict[str, ProcessSession] = {}
+         self._lock = threading.Lock()
++        self._checkpoint_output_lock = threading.Lock()
++        self._last_output_checkpoint_at = 0.0
+         # Side-channel for check_interval watchers (gateway reads after agent run)
+         self.pending_watchers: List[Dict[str, Any]] = []
+         # Unified queue for all background events (distinguished by "type"); the CLI
+@@ -445,6 +447,15 @@ class ProcessRegistry:
+         with suppress(Exception):
+             sink(session, chunk)
+ 
++    def _checkpoint_live_output(self) -> None:
++        """Publish process tails for peer gateway processes, at most 4Hz."""
++        now = time.monotonic()
++        with self._checkpoint_output_lock:
++            if now - self._last_output_checkpoint_at < 0.25:
++                return
++            self._last_output_checkpoint_at = now
++        self._write_checkpoint()
++
+     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
+         """Scan a freshly-read chunk for watch patterns and queue notifications.
+         Per-session rate limiting (see WATCH_* constants): one match per cooldown
+@@ -1091,6 +1102,7 @@ class ProcessRegistry:
+                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                     self._check_watch_patterns(session, delta)
+                     self._emit_output(session, delta)
++                    self._checkpoint_live_output()
+ 
+                 check = env.execute(
+                     f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?", timeout=5)
+@@ -1141,6 +1153,7 @@ class ProcessRegistry:
+         session.append_output(text)
+         self._check_watch_patterns(session, text)
+         self._emit_output(session, text)
++        self._checkpoint_live_output()
+ 
+     def _finish_exited(self, session: ProcessSession, exit_code) -> None:
+         """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish."""
+@@ -1894,6 +1907,10 @@ class ProcessRegistry:
+                     # See #77484.
+                     entry["command"] = redact_sensitive_text(s.command, code_file=True)
+                     entry["owner_task_id"] = s.owner_task_id or s.task_id
++                    # Gateways have separate Python heaps. Persist a redacted
++                    # rolling tail so peer Desktop clients can render live logs.
++                    entry["output_tail"] = redact_sensitive_text(
++                        s.output_buffer[-s.max_output_chars:], code_file=True)
+                     entries.append(entry)
+                 if extra_entries:
+                     tracked_ids = {item.get("session_id") for item in entries}
+@@ -1903,6 +1920,61 @@ class ProcessRegistry:
+         except Exception as e:
+             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+ 
++    def sync_from_checkpoint(self) -> int:
++        """Import or refresh live processes owned by another gateway process.
++
++        Repeated polling never replaces locally-owned sessions or rewrites the
++        shared checkpoint. Detached mirrors only receive already-redacted tails.
++        """
++        if not CHECKPOINT_PATH.exists():
++            return 0
++        try:
++            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
++        except Exception:
++            return 0
++
++        added = 0
++        for entry in entries if isinstance(entries, list) else []:
++            process_id = str(entry.get("session_id") or "")
++            pid = entry.get("pid")
++            pid_scope = entry.get("pid_scope", "host")
++            recorded_start = entry.get("host_start_time")
++            if not process_id or not pid or pid_scope != "host":
++                continue
++            if not self._host_pid_is_ours(pid, recorded_start):
++                continue
++
++            with self._lock:
++                existing = self._running.get(process_id) or self._finished.get(process_id)
++            if existing is not None:
++                if existing.detached:
++                    with existing._lock:
++                        existing.output_buffer = str(entry.get("output_tail") or "")[-existing.max_output_chars:]
++                continue
++
++            session = ProcessSession(
++                id=process_id,
++                command=entry.get("command", "unknown"),
++                task_id=entry.get("task_id", ""),
++                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
++                session_key=entry.get("session_key", ""),
++                pid=pid,
++                host_start_time=recorded_start,
++                pid_scope=pid_scope,
++                systemd_unit=entry.get("systemd_unit", ""),
++                cwd=entry.get("cwd"),
++                started_at=entry.get("started_at", time.time()),
++                output_buffer=str(entry.get("output_tail") or "")[-MAX_OUTPUT_CHARS:],
++                detached=True,
++                parent_session_id=entry.get("parent_session_id", ""),
++                # The owner gateway remains solely responsible for delivery.
++                notify_on_complete=False,
++            )
++            with self._lock:
++                self._running[session.id] = session
++            added += 1
++        return added
++
+     def recover_from_checkpoint(self) -> int:
+         """On gateway startup, probe PIDs from the checkpoint file; returns how many
+         were recovered as detached sessions."""
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 9d9e457f..29f53dfd 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -233,19 +233,27 @@ for _name, (_code, _build) in _SIMPLE_RPCS.items():
+     # Look the builder up at call time: bind_module rebinds the table's lambdas onto server globals.
+     _rpc(_name, _code)(lambda rid, params, _n=_name: _ok(rid, _SIMPLE_RPCS[_n][1](params)))
+ del _name, _code, _build
+-_rpc("process.list", 5010, live_session=True)(
+-    lambda rid, params, session: _ok(rid, {"processes": _session_processes(session)}))
++@_rpc("process.list", 5010)
++def _(rid, params: dict) -> dict:
++    session, err = _process_scope_session(params, rid)
++    if err:
++        return err
++    return _ok(rid, {"processes": _session_processes(session)})
+ 
+ 
+-@_rpc("process.kill", live_session=True, fail_code=5010)
+-def _(rid, params: dict, session) -> dict:
++@_rpc("process.kill", fail_code=5010)
++def _(rid, params: dict) -> dict:
+     """Kill ONE background process, scoped to the caller's session (unlike process.stop's kill_all)."""
++    session, err = _process_scope_session(params, rid)
++    if err:
++        return err
+     proc_id = str(params.get("process_id") or "")
+     if not proc_id:
+         return _err(rid, 4012, "process_id required")
+     registry = _tools_mod("tools.process_registry").process_registry
++    registry.sync_from_checkpoint()
+     proc = registry.get(proc_id)
+-    if proc is None or str(getattr(proc, "session_key", "") or "") != str(session.get("session_key") or ""):
++    if proc is None or not _process_owned_by_session(proc, str(session.get("session_key") or "")):
+         return _err(rid, 4044, f"no such process: {proc_id}")
+     return _ok(rid, registry.kill_process(proc_id))
+ 
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 49266de5..023db00f 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -3054,19 +3054,44 @@ def _respond(rid, params, key, *, allow_expired=False):
+ # ── Methods: tools & system ──────────────────────────────────────────
+ 
+ 
++def _process_owned_by_session(proc, session_key: str) -> bool:
++    """Whether a process belongs to a live or durable conversation view."""
++    key = str(session_key or "")
++    if not key:
++        return False
++    return key in {
++        str(getattr(proc, "session_key", "") or ""),
++        str(getattr(proc, "owner_task_id", "") or ""),
++        str(getattr(proc, "parent_session_id", "") or ""),
++    }
++
++
++def _process_scope_session(params: dict, rid):
++    """Resolve a runtime scope, falling back to its durable conversation id."""
++    session, err = _sess(params, rid)
++    if not err:
++        return session, None
++
++    durable_id = str(params.get("session_id") or "")
++    if not durable_id:
++        return None, err
++    return {"session_key": durable_id}, None
++
++
+ def _session_processes(session: dict) -> list:
+-    """Background processes owned by this session (registry session_key match)."""
++    """Background processes owned by this runtime or durable conversation."""
+     # Drain completion notifications that arrived during this turn. The background poller handles
+     # between-turn delivery; this is the safety net for events that arrived mid-turn. Ownership filter
+     # (#42674, #35652): a turn finishing in session B must not consume an event that belongs to session A.
+     # The registry requeues every addressed event this session cannot positively claim; the poller then
+     # delivers it to a live owner or drops an orphan.
+     from tools.process_registry import process_registry
++    process_registry.sync_from_checkpoint()
+     key = str(session.get("session_key") or "")
+     owned = []
+     for entry in process_registry.list_sessions():
+         proc = process_registry.get(entry["session_id"])
+-        if proc is not None and str(getattr(proc, "session_key", "") or "") == key:
++        if proc is not None and _process_owned_by_session(proc, key):
+             entry["output_tail"] = (proc.output_buffer or "")[-4000:]  # the 200-char list preview is too thin for the viewer
+             owned.append(entry)
+     return owned
